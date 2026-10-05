@@ -16,18 +16,14 @@ const getBasePath = () => {
 
 const data: ISiteMetadataResult = {
   siteTitle: 'Running Page',
-  siteUrl: 'https://run.viazure.cc',
-  logo: 'https://viazure.cc/icons/favicon.svg',
+  siteUrl: '',
+  logo: `${getBasePath()}/images/favicon.png`,
   description:
     '世界上想不明白的事情那么多，想到就能做的事情太少了。—— 关于跑步',
   navLinks: [
     {
       name: 'Summary',
       url: `${getBasePath()}/summary`,
-    },
-    {
-      name: 'Blog',
-      url: 'https://viazure.cc',
     },
     {
       name: 'About',

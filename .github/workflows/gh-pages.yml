@@ -2,6 +2,8 @@ name: Publish GitHub Pages
 
 # Controls when the action will run.
 on:
+  push:
+    branches: [master]
   workflow_dispatch:
     inputs:
       save_data_in_github_cache:
@@ -97,7 +99,9 @@ jobs:
         env:
           # Prefer VITE_MAPBOX_TOKEN if that Secret exists; otherwise MAPBOX_TOKEN (upstream default name)
           VITE_MAPBOX_TOKEN: ${{ secrets.VITE_MAPBOX_TOKEN || secrets.MAPBOX_TOKEN }}
-        run: PATH_PREFIX=/ pnpm build
+        # 站点在 https://<用户名>.github.io/<仓库名>/ 下，base 必须带仓库名，否则白屏
+        # 若仓库名是 <用户名>.github.io 或绑定了自定义域名，改回 PATH_PREFIX=/
+        run: PATH_PREFIX="/${GITHUB_REPOSITORY#*/}" pnpm build
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
