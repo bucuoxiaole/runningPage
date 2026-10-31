@@ -511,6 +511,42 @@ export function useMobileMapDock(
     expand();
   }, [expanded, collapse, expand]);
 
+  /**
+   * Auto-collapse once the slot is fully visible again.
+   *
+   * Option A keeps the dock pinned until the user taps the FAB, so scrolling
+   * back to where the in-flow map already fits on screen still showed the
+   * floating map. Whenever the whole slot sits between the sticky header and
+   * the bottom of the viewport, hand the map back to the flow. Scroll driven
+   * only — never on mount — so it cannot fight the enter motion.
+   */
+  useEffect(() => {
+    if (!active || !expanded) return;
+    let raf = 0;
+    const check = () => {
+      raf = 0;
+      if (pinMotionRef.current === 'out') return;
+      const slot = slotRef.current;
+      if (!slot) return;
+      const rect = slot.getBoundingClientRect();
+      if (rect.width <= 1 || rect.height <= 1) return;
+      const fullyVisible =
+        rect.top >= HEADER_INSET_PX - 2 &&
+        rect.bottom <= window.innerHeight - 2;
+      if (fullyVisible) collapse();
+    };
+    const onScrollOrResize = () => {
+      if (raf) return;
+      raf = requestAnimationFrame(check);
+    };
+    window.addEventListener('scroll', onScrollOrResize, { passive: true });
+    window.addEventListener('resize', onScrollOrResize);
+    return () => {
+      if (raf) cancelAnimationFrame(raf);
+      window.removeEventListener('scroll', onScrollOrResize);
+      window.removeEventListener('resize', onScrollOrResize);
+    };
+  }, [active, expanded, collapse, slotRef]);
   const showFab = active && (expanded || outOfView || holdSpacer);
   // Reserve slot height while away, expanded (map is fixed), or handing off.
   const lockHeight =
