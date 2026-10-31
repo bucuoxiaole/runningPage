@@ -19,6 +19,8 @@ const PIN_OUT_MS = 420;
 const AT_HOME_PX = 12;
 /** Keep slot spacer after unfixed so in-flow height owns layout. */
 const HANDOFF_MS = 100;
+/** Wait for the scroll to settle before auto-collapsing the dock. */
+const AUTO_COLLAPSE_SETTLE_MS = 140;
 
 export type MapDockFrame = {
   left: number;
@@ -519,12 +521,18 @@ export function useMobileMapDock(
    * floating map. Whenever the whole slot sits between the sticky header and
    * the bottom of the viewport, hand the map back to the flow. Scroll driven
    * only — never on mount — so it cannot fight the enter motion.
+   *
+   * Debounced on purpose: reading layout on every scroll frame, and starting
+   * the release animation mid-momentum (when the target slot box is still
+   * moving), is what made the scroll feel rough. Waiting for the scroll to
+   * settle keeps the scroll thread free and lets the hand-back animation
+   * land on the final slot position instead of snapping.
    */
   useEffect(() => {
     if (!active || !expanded) return;
-    let raf = 0;
+    let timer = 0;
     const check = () => {
-      raf = 0;
+      timer = 0;
       if (pinMotionRef.current === 'out') return;
       const slot = slotRef.current;
       if (!slot) return;
@@ -535,16 +543,16 @@ export function useMobileMapDock(
         rect.bottom <= window.innerHeight - 2;
       if (fullyVisible) collapse();
     };
-    const onScrollOrResize = () => {
-      if (raf) return;
-      raf = requestAnimationFrame(check);
+    const schedule = () => {
+      if (timer) window.clearTimeout(timer);
+      timer = window.setTimeout(check, AUTO_COLLAPSE_SETTLE_MS);
     };
-    window.addEventListener('scroll', onScrollOrResize, { passive: true });
-    window.addEventListener('resize', onScrollOrResize);
+    window.addEventListener('scroll', schedule, { passive: true });
+    window.addEventListener('resize', schedule);
     return () => {
-      if (raf) cancelAnimationFrame(raf);
-      window.removeEventListener('scroll', onScrollOrResize);
-      window.removeEventListener('resize', onScrollOrResize);
+      if (timer) window.clearTimeout(timer);
+      window.removeEventListener('scroll', schedule);
+      window.removeEventListener('resize', schedule);
     };
   }, [active, expanded, collapse, slotRef]);
   const showFab = active && (expanded || outOfView || holdSpacer);
