@@ -60,6 +60,35 @@ DEFAULT_OUT_DIR = os.path.join(_ROOT, "public", "splits")
 # --------------------------------------------------------------------------
 # small helpers
 # --------------------------------------------------------------------------
+def _js_id_str(run_id: int) -> str:
+    """Format a run id the way JavaScript's ``String(Number(id))`` does.
+
+    Keep uses 19-digit ids that exceed ``Number.MAX_SAFE_INTEGER``. The browser
+    keeps ``activity.run_id`` as a float and requests
+    ``splits/<String(Number(id))>.json``, so the generated file names must use
+    the same (lossy) value, otherwise every lookup 404s.
+    """
+    f = float(run_id)
+    if abs(f) < 2 ** 53:
+        return str(int(f))
+    shortest = None
+    for prec in range(1, 18):
+        cand = f"{f:.{prec}e}"
+        if float(cand) == f:
+            shortest = cand
+            break
+    mant, exp = shortest.split("e")
+    exp = int(exp)
+    sign = "-" if mant.startswith("-") else ""
+    head, _, tail = mant.lstrip("-").partition(".")
+    digits = head + tail
+    shift = exp - len(tail)
+    if shift > 0:
+        digits += "0" * shift
+    elif shift < 0:
+        digits = digits[:shift]
+    return sign + (digits.lstrip("0") or "0")
+
 def _num(value: Any) -> float | None:
     """Return a finite float or None (FIT invalid values become None)."""
     if value is None or isinstance(value, (bool, str, list, dict)):
@@ -1288,7 +1317,7 @@ def run(
             and known_src.get("mtime") == mtime
             and (
                 known_src.get("run_id") is None
-                or os.path.exists(os.path.join(out_dir, f"{known_src['run_id']}.json"))
+                or os.path.exists(os.path.join(out_dir, f"{_js_id_str(known_src['run_id'])}.json"))
             )
             and (
                 known_src.get("run_id") is None
@@ -1319,7 +1348,7 @@ def run(
             shadowed += 1
             continue
         claimed[rid] = rank
-        with open(os.path.join(out_dir, f"{rid}.json"), "w", encoding="utf-8") as f:
+        with open(os.path.join(out_dir, f"{_js_id_str(rid)}.json"), "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
         sources[key] = {"mtime": mtime, "run_id": rid}
         written += 1
