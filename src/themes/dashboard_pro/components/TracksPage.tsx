@@ -1,4 +1,13 @@
-import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+} from 'react';
+import { useMapChromeIdle } from '@/hooks/useMapChromeIdle';
 import { toPng } from 'html-to-image';
 import * as polyline from '@mapbox/polyline';
 import mapboxgl from 'mapbox-gl';
@@ -25,19 +34,48 @@ import {
 import type { Coordinate } from '@/utils/routeAnimation';
 import {
   CHASE_LAYER_IDS,
+  attachMapModeButtons,
   clearMapTerrain,
-  createChaseControlButton,
   createMapChaseController,
-  injectMapTerrain,
+  createMapOrbitController,
+  isMapFullscreen,
+  PLAYBACK_LAYOUT_SETTLE_MS,
+  PLAYBACK_LAYOUT_EXIT_RESIZE_MS,
   removeChaseHighlight,
   setChaseHighlightLine,
   updateChaseControlButton,
+  updateFullscreenButton,
+  type MapModeControlHandles,
+  type PlaybackProgress,
 } from '@/utils/mapChase3d';
 import {
+  fitMapToEndCard,
   fitMapToSelectedRoute,
   fitTrackMapOverview,
+  overviewOrbitCoords,
+  waitForMapIdle,
 } from '@/utils/mapRouteFit';
+import {
+  buildMapVideoEndCard,
+  buildMapVideoOverlayStats,
+  nextPlaybackSpeed,
+  PlaybackHudView,
+  usePlaybackSeries,
+} from './PlaybackHud';
+import { loadSplits } from '@/core/splits';
+import { getPlaybackPrefs, setPlaybackPrefs } from '@/utils/playbackPrefs';
+import {
+  defaultMapVideoFilename,
+  downloadBlob,
+  MapVideoAbortedError,
+  MapVideoUnsupportedError,
+  phoneChaseZoomOutExtra,
+  startMapVideoCapture,
+  type MapVideoCapture,
+} from '@/utils/exportMapVideo';
 import './RouteMap.css';
+import { MapDockFab } from './MapDockFab';
+import { useMobileMapDock } from '../hooks/useMobileMapDock';
 
 type SportType = 'Run';
 
@@ -129,11 +167,13 @@ function TrackMap({
   activities,
   dark,
   lightsOff = false,
+  onPlaybackChange,
 }: {
   activity: Activity | null;
   activities: Activity[];
   dark?: boolean;
   lightsOff?: boolean;
+  onPlaybackChange?: (playing: boolean) => void;
 }) {
   const { locale, t } = useLocale();
   const mapContainer = useRef<HTMLDivElement>(null);
@@ -143,6 +183,7 @@ function TrackMap({
   const activitiesRef = useRef(activities);
   const lightsOffRef = useRef(lightsOff);
   const chaseRef = useRef(createMapChaseController());
+  const orbitRef = useRef(createMapOrbitController());
   const selectedCoordsRef = useRef<Coordinate[] | null>(null);
   const styleIdleRef = useRef(false);
   const refitViewRef = useRef<() => void>(() => {});
@@ -150,18 +191,79 @@ function TrackMap({
   const animKeyRef = useRef<string | null>(null);
   /** Non-null while a chase for this run_id should show as active in the UI. */
   const [chaseRunId, setChaseRunId] = useState<string | null>(null);
+  const [playbackSnap, setPlaybackSnap] = useState<PlaybackProgress | null>(
+    null
+  );
+  const [view3d, setView3d] = useState(false);
+  const view3dRef = useRef(false);
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const [hudHeight, setHudHeight] = useState(0);
+  const [exporting, setExporting] = useState(false);
+  const [exportEnding, setExportEnding] = useState(false);
+  const [exportConverting, setExportConverting] = useState(false);
+  const [exportMessage, setExportMessage] = useState<string | null>(null);
+  const fsRootRef = useRef<HTMLDivElement>(null);
+  const [chromeRoot, setChromeRoot] = useState<HTMLDivElement | null>(null);
+  const bindFsRoot = useCallback((el: HTMLDivElement | null) => {
+    fsRootRef.current = el;
+    setChromeRoot(el);
+  }, []);
+  useMapChromeIdle(chromeRoot);
+  const videoCaptureRef = useRef<MapVideoCapture | null>(null);
   const chasing =
     chaseRunId != null &&
     activity != null &&
     String(activity.run_id) === chaseRunId;
-  const chaseButtonRef = useRef<HTMLButtonElement | null>(null);
-  const toggle3dRef = useRef<() => void>(() => {});
+  const playbackSeries = usePlaybackSeries(chasing, activity?.run_id ?? null);
+  const playbackSeriesRef = useRef(playbackSeries);
+  const exportMetaRef = useRef({
+    movingTimeSec: 0,
+    averageSpeedMs: 0,
+    startDateLocal: '',
+    sport: 'Run',
+    distanceMeters: 0,
+    hrBpm: null as number | null,
+  });
+  const caloriesRef = useRef<{ runId: number | null; kcal: number | null }>({
+    runId: null,
+    kcal: null,
+  });
+  useEffect(() => {
+    playbackSeriesRef.current = playbackSeries;
+    exportMetaRef.current = {
+      movingTimeSec: activity ? parseMovingTime(activity.moving_time) : 0,
+      averageSpeedMs: activity?.average_speed ?? 0,
+      startDateLocal: activity?.start_date_local ?? '',
+      sport: activity?.type ?? 'Run',
+      distanceMeters: activity?.distance ?? 0,
+      hrBpm:
+        activity?.average_heartrate != null && activity.average_heartrate > 0
+          ? Math.round(activity.average_heartrate)
+          : null,
+    };
+  }, [playbackSeries, activity]);
+
+  useEffect(() => {
+    onPlaybackChange?.(chasing);
+  }, [chasing, onPlaybackChange]);
+  const modeHandlesRef = useRef<MapModeControlHandles>({
+    fullscreenButton: null,
+    chaseButton: null,
+  });
+  const toggleChaseRef = useRef<() => void>(() => {});
   const [provider, setProvider] = useState<BasemapProvider>(
     initialBasemapProvider
   );
   const useBlank = lightsOff;
-  // Flat chase works on CARTO; Mapbox DEM/buildings are best-effort in injectMapTerrain.
+  // Orbit / DEM / buildings are best-effort in injectMapTerrain (no-op on CARTO).
   const can3d = !lightsOff;
+  const hasOwnGps = Boolean(
+    activity?.summary_polyline && activity.summary_polyline.length > 20
+  );
+  /** 3D stays available in overview; only privacy blanks it. */
+  const canOffer3d = can3d;
+  /** Chase playback works on the blank privacy basemap; 3D does not. */
+  const canOfferPlayback = hasOwnGps;
   const bg = dark !== false ? '#0b0d10' : '#f4f5f7';
   const style = useBlank
     ? blankMapStyle(bg)
@@ -176,6 +278,33 @@ function TrackMap({
 
   const stopAnimations = () => {
     chaseRef.current.stop({ silent: true });
+    orbitRef.current.stop();
+  };
+
+  const flattenView = (m: mapboxgl.Map) => {
+    orbitRef.current.stop();
+    if (!chaseRef.current.isAnimating()) {
+      clearMapTerrain(m);
+      m.easeTo({ pitch: 0, bearing: 0, duration: 600 });
+    }
+  };
+
+  const startOrbitIfNeeded = (
+    m: mapboxgl.Map,
+    coords: Coordinate[],
+    opts?: { immediate?: boolean }
+  ) => {
+    if (!view3dRef.current || !can3d || coords.length < 2) {
+      flattenView(m);
+      return;
+    }
+    if (chaseRef.current.isAnimating()) return;
+    orbitRef.current.start({
+      map: m,
+      coords,
+      isDark: dark !== false,
+      immediate: opts?.immediate,
+    });
   };
 
   const removeRouteLayers = (m: mapboxgl.Map) => {
@@ -203,16 +332,6 @@ function TrackMap({
     }
   };
 
-  const showSelected2d = (
-    m: mapboxgl.Map,
-    coords: Coordinate[],
-    color: string,
-    privacy: boolean
-  ) => {
-    setChaseHighlightLine(m, coords, color);
-    fitMapToSelectedRoute(m, coords, privacy);
-  };
-
   useEffect(() => {
     activityRef.current = activity;
     activitiesRef.current = activities;
@@ -231,8 +350,11 @@ function TrackMap({
       if (act?.summary_polyline && act.summary_polyline.length > 20) {
         const runId = String(act.run_id);
         const animKey = `${runId}|${privacy ? 1 : 0}|${useBlank ? 1 : 0}`;
-        // Keep camera/layers if same selection and chase already running
-        if (animKeyRef.current === animKey && chaseRef.current.isAnimating()) {
+        // Keep camera/layers if same selection and chase/orbit already running
+        if (
+          animKeyRef.current === animKey &&
+          (chaseRef.current.isAnimating() || orbitRef.current.isAnimating())
+        ) {
           return;
         }
 
@@ -275,8 +397,15 @@ function TrackMap({
           });
         }
 
-        // Manual 3D: selection always starts as 2D overview
-        showSelected2d(m, coords, color, privacy);
+        setChaseHighlightLine(m, coords, color);
+        if (view3dRef.current && !privacy) {
+          // Immediate fit: a 1.2s easeTo leaves the old city on screen while
+          // all-routes still paints the previous track under the pitched camera.
+          startOrbitIfNeeded(m, coords, { immediate: true });
+        } else {
+          flattenView(m);
+          fitMapToSelectedRoute(m, coords, privacy);
+        }
         applyLightsOff(m, privacy);
         return;
       }
@@ -285,7 +414,6 @@ function TrackMap({
       selectedCoordsRef.current = null;
       stopAnimations();
       removeRouteLayers(m);
-      clearMapTerrain(m);
 
       const features = acts
         .filter((a) => a.summary_polyline)
@@ -300,6 +428,7 @@ function TrackMap({
           },
         }));
       if (!features.length) {
+        flattenView(m);
         applyLightsOff(m, privacy);
         return;
       }
@@ -317,14 +446,13 @@ function TrackMap({
           'line-opacity': privacy ? 0.85 : 0.5,
         },
       });
-      const allCoords = features.flatMap(
-        (f) => f.geometry.coordinates as [number, number][]
-      );
-      if (!allCoords.length) {
-        applyLightsOff(m, privacy);
-        return;
+      const orbitCoords = overviewOrbitCoords(acts);
+      if (view3dRef.current && !privacy && orbitCoords.length > 0) {
+        startOrbitIfNeeded(m, orbitCoords, { immediate: true });
+      } else {
+        flattenView(m);
+        fitTrackMapOverview(m, acts, privacy);
       }
-      fitTrackMapOverview(m, acts, privacy);
       applyLightsOff(m, privacy);
     };
   });
@@ -337,34 +465,117 @@ function TrackMap({
       const coords = selectedCoordsRef.current;
       const privacy = lightsOffRef.current;
       if (act && coords && coords.length > 0) {
-        showSelected2d(m, coords, getColor(act), privacy);
+        setChaseHighlightLine(m, coords, getColor(act));
+        if (view3dRef.current && !privacy) {
+          startOrbitIfNeeded(m, coords);
+        } else {
+          fitMapToSelectedRoute(m, coords, privacy);
+        }
+      } else if (view3dRef.current && !privacy) {
+        const orbitCoords = overviewOrbitCoords(activitiesRef.current);
+        if (orbitCoords.length > 0) startOrbitIfNeeded(m, orbitCoords);
+        else {
+          flattenView(m);
+          fitTrackMapOverview(m, activitiesRef.current, privacy);
+        }
       } else {
+        flattenView(m);
         fitTrackMapOverview(m, activitiesRef.current, privacy);
       }
       setNeedsRecenter(false);
     };
   });
 
+  const restoreOverviewLine = (m: mapboxgl.Map) => {
+    if (m.getLayer('all-routes')) {
+      m.setPaintProperty(
+        'all-routes',
+        'line-opacity',
+        lightsOffRef.current ? 0.35 : 0.2
+      );
+    }
+  };
+
+  const restoreSelectedHighlight = (m: mapboxgl.Map) => {
+    const act = activityRef.current;
+    const coords = selectedCoordsRef.current;
+    if (act && coords && coords.length >= 2) {
+      setChaseHighlightLine(m, coords, getColor(act));
+    }
+  };
+
+  const resolveOrbitCoords = (): Coordinate[] | null => {
+    const selected = selectedCoordsRef.current;
+    if (selected && selected.length >= 2) return selected;
+    const overview = overviewOrbitCoords(activitiesRef.current);
+    return overview.length > 0 ? overview : null;
+  };
+
   const handleToggle3d = () => {
+    const m = map.current;
+    const coords = resolveOrbitCoords();
+    if (!m || !coords || !canOffer3d) return;
+    const next = !view3dRef.current;
+    view3dRef.current = next;
+    setView3d(next);
+    if (chaseRef.current.isAnimating()) {
+      chaseRef.current.setCameraMode(next ? '3d' : '2d');
+      return;
+    }
+    if (next) {
+      startOrbitIfNeeded(m, coords);
+      return;
+    }
+    flattenView(m);
+    if (selectedCoordsRef.current && selectedCoordsRef.current.length >= 2) {
+      fitMapToSelectedRoute(m, selectedCoordsRef.current, lightsOffRef.current);
+    } else {
+      fitTrackMapOverview(m, activitiesRef.current, lightsOffRef.current);
+    }
+  };
+
+  const handleToggleChase = () => {
     const m = map.current;
     const act = activityRef.current;
     const coords = selectedCoordsRef.current;
-    if (!m || !act || !coords || !can3d) return;
+    if (!m || !act || !coords || !canOfferPlayback) return;
 
     if (chaseRef.current.isAnimating()) {
-      chaseRef.current.stop({ silent: true });
+      // Put the full route back BEFORE stop tears down layers — stop() used
+      // to removeChaseHighlight first and blank the map ~1–2 frames.
+      videoCaptureRef.current?.abort();
+      videoCaptureRef.current = null;
+      setExporting(false);
+      setExportEnding(false);
+      setExportConverting(false);
+      chaseRef.current.setZoomOutExtra(0);
+      chaseRef.current.setStrokeScale(1);
+      restoreOverviewLine(m);
+      restoreSelectedHighlight(m);
+      // keepHighlight only on mobile — avoids blanking during height settle.
+      // Desktop restores selected highlight synchronously; keepHighlight there
+      // left chase layers fighting the web selected line (start pin drift).
+      const mobileDock =
+        typeof window !== 'undefined' &&
+        window.matchMedia('(max-width: 1023px)').matches;
+      chaseRef.current.stop({
+        silent: true,
+        keepHighlight: mobileDock,
+      });
       setChaseRunId(null);
-      showSelected2d(m, coords, getColor(act), lightsOffRef.current);
-      if (m.getLayer('all-routes')) {
-        m.setPaintProperty(
-          'all-routes',
-          'line-opacity',
-          lightsOffRef.current ? 0.35 : 0.2
-        );
+      setPlaybackSnap(null);
+      if (!view3dRef.current) clearMapTerrain(m);
+      // Ease immediately like activity-switch; settle effect resizes then
+      // gently corrects for the short canvas (no map.stop / blank-then-pop).
+      if (view3dRef.current) {
+        startOrbitIfNeeded(m, coords);
+      } else {
+        fitMapToSelectedRoute(m, coords, lightsOffRef.current);
       }
       return;
     }
 
+    orbitRef.current.stop();
     const runId = String(act.run_id);
     chaseRef.current.start(
       {
@@ -374,28 +585,281 @@ function TrackMap({
         distanceKm: act.distance / 1000,
         runId,
         isDark: dark !== false,
+        cameraMode: can3d && view3dRef.current ? '3d' : '2d',
+        showEndpoints: getPlaybackPrefs().showEndpoints,
+        lockOrientation: getPlaybackPrefs().lockOrientation,
+        endpointTitles:
+          locale === 'en'
+            ? { start: 'Start', end: 'Finish' }
+            : { start: '起点', end: '终点' },
+        compassTitles: {
+          lock: t('bearingLock'),
+          follow: t('bearingFollow'),
+        },
         overviewLayerId: 'all-routes',
+        getEndView: () => (view3dRef.current ? 'keep' : 'flat'),
+        // Mobile/tablet card grows on play — wait so start Marker matches canvas.
+        // Desktop must pass 0 (master path) or the start pin drifts off the track.
+        layoutSettleMs:
+          typeof window !== 'undefined' &&
+          window.matchMedia('(max-width: 1023px)').matches
+            ? PLAYBACK_LAYOUT_SETTLE_MS
+            : 0,
       },
       {
         onStart: () => setChaseRunId(runId),
-        onEnd: () => setChaseRunId(null),
+        onProgress: (p) => setPlaybackSnap(p),
+        onEnd: () => {
+          if (videoCaptureRef.current) {
+            videoCaptureRef.current.stop();
+            return;
+          }
+          restoreOverviewLine(m);
+          restoreSelectedHighlight(m);
+          setChaseRunId(null);
+          setPlaybackSnap(null);
+          if (!view3dRef.current) clearMapTerrain(m);
+          const endCoords = selectedCoordsRef.current;
+          if (endCoords && endCoords.length >= 2) {
+            if (view3dRef.current) startOrbitIfNeeded(m, endCoords);
+            else fitMapToSelectedRoute(m, endCoords, lightsOffRef.current);
+          }
+        },
+        onBearingLockChange: (locked) => {
+          setPlaybackPrefs({ lockOrientation: locked });
+        },
       }
     );
   };
 
+  const handleExportVideo = async (opts: {
+    includeHud: boolean;
+    sizeMode: 'native' | 'phone';
+  }) => {
+    if (exporting && videoCaptureRef.current) {
+      videoCaptureRef.current.stop();
+      return;
+    }
+    const m = map.current;
+    if (!m || !chasing) return;
+    try {
+      const canvas = m.getCanvas();
+      chaseRef.current.setZoomOutExtra(
+        opts.sizeMode === 'phone'
+          ? phoneChaseZoomOutExtra(canvas.clientWidth, canvas.clientHeight)
+          : 0
+      );
+      chaseRef.current.seek(0);
+      if (chaseRef.current.isPaused()) chaseRef.current.resume();
+      await new Promise<void>((resolve) => {
+        requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+      });
+      const runId = activity?.run_id;
+      if (runId != null && caloriesRef.current.runId !== runId) {
+        caloriesRef.current = { runId, kcal: null };
+        void loadSplits(runId).then((data) => {
+          if (caloriesRef.current.runId !== runId) return;
+          const kcal = data?.summary?.calories;
+          caloriesRef.current.kcal = kcal != null && kcal > 0 ? kcal : null;
+        });
+      }
+      const capture = await startMapVideoCapture({
+        mapCanvas: m.getCanvas(),
+        includeHud: opts.includeHud,
+        sizeMode: opts.sizeMode,
+        getOverlayStats: () => {
+          const snap = chaseRef.current.getSnapshot();
+          if (!snap) return null;
+          const series = playbackSeriesRef.current;
+          const meta = exportMetaRef.current;
+          return buildMapVideoOverlayStats({
+            progress: snap.progress,
+            distanceKm: snap.distanceKm,
+            hr: series?.hr ?? null,
+            time: series?.time ?? null,
+            movingTimeSec: meta.movingTimeSec,
+            averageSpeedMs: meta.averageSpeedMs,
+            labels: {
+              time: t('timeLabel'),
+              pace: t('avgPace'),
+              hr: t('hr'),
+              km: 'km',
+            },
+          });
+        },
+        prepareEndCard: async () => {
+          const live = map.current;
+          const coords = selectedCoordsRef.current;
+          if (!live || !coords || coords.length < 2) return;
+          chaseRef.current.showFullRoute();
+          fitMapToEndCard(live, coords, { sizeMode: opts.sizeMode });
+          await waitForMapIdle(live);
+        },
+        getEndCard: () => {
+          const meta = exportMetaRef.current;
+          if (!meta.startDateLocal || meta.distanceMeters <= 0) return null;
+          return buildMapVideoEndCard({
+            locale: locale === 'en' ? 'en' : 'zh',
+            startDateLocal: meta.startDateLocal,
+            sport: meta.sport,
+            distanceMeters: meta.distanceMeters,
+            movingTimeSec: meta.movingTimeSec,
+            averageSpeedMs: meta.averageSpeedMs,
+            hrBpm: meta.hrBpm,
+            calories: caloriesRef.current.kcal,
+          });
+        },
+        getMarkerPoints: () => {
+          const live = map.current;
+          const coords = selectedCoordsRef.current;
+          const canvas = live?.getCanvas();
+          if (!live || !coords || coords.length < 2 || !canvas) return null;
+          const start = live.project(coords[0]);
+          const end = live.project(coords[coords.length - 1]);
+          return {
+            start: { x: start.x, y: start.y },
+            end: { x: end.x, y: end.y },
+            cssWidth: canvas.clientWidth || 1,
+            cssHeight: canvas.clientHeight || 1,
+          };
+        },
+        onPhaseChange: (phase) => {
+          setExportEnding(phase === 'ending');
+          setExportConverting(phase === 'converting');
+        },
+        onCoverScale: (scale) => {
+          chaseRef.current.setStrokeScale(scale > 1 ? 1.45 / scale : 1);
+        },
+      });
+      videoCaptureRef.current = capture;
+      setExporting(true);
+      setExportEnding(false);
+      setExportConverting(false);
+      setExportMessage(null);
+      const blob = await capture.done;
+      const filename = defaultMapVideoFilename();
+      downloadBlob(blob, filename);
+    } catch (err) {
+      if (err instanceof MapVideoAbortedError) {
+        /* cancelled */
+      } else if (err instanceof MapVideoUnsupportedError) {
+        setExportMessage(t('exportVideoUnsupported'));
+      } else {
+        console.error('Video export failed:', err);
+        setExportMessage(t('exportVideoFailed'));
+      }
+    } finally {
+      const hadCapture = videoCaptureRef.current != null;
+      videoCaptureRef.current = null;
+      setExporting(false);
+      setExportEnding(false);
+      setExportConverting(false);
+      chaseRef.current.setZoomOutExtra(0);
+      chaseRef.current.setStrokeScale(1);
+      window.setTimeout(() => setExportMessage(null), 4000);
+      if (hadCapture) {
+        const live = map.current;
+        chaseRef.current.stop({ silent: true });
+        setChaseRunId(null);
+        setPlaybackSnap(null);
+        if (live) {
+          restoreOverviewLine(live);
+          restoreSelectedHighlight(live);
+          if (!view3dRef.current) clearMapTerrain(live);
+        }
+      }
+    }
+  };
+
   useEffect(() => {
-    toggle3dRef.current = handleToggle3d;
+    return () => {
+      videoCaptureRef.current?.abort();
+      videoCaptureRef.current = null;
+    };
+  }, []);
+
+  // Clip shell eases height; parent drops is-play-sized after settle.
+  // Match RouteMap: wait settle, then exit-resize + one fitMapToSelectedRoute (activity-switch feel).
+  // Desktop: no card grow — do not resize mid-flyTo (start pin drift).
+  const wasChasingRef = useRef(false);
+  useEffect(() => {
+    const m = map.current;
+    if (!m) return;
+    const ending = wasChasingRef.current && !chasing;
+    const starting = !wasChasingRef.current && chasing;
+    wasChasingRef.current = chasing;
+    const grow =
+      typeof window !== 'undefined' &&
+      window.matchMedia('(max-width: 1023px)').matches;
+    const tick = () => {
+      try {
+        m.resize();
+      } catch {
+        /* map may already be gone */
+      }
+    };
+    // Immediate resize when play surface jumps to final height (avoids white letterbox).
+    let raf1 = 0;
+    let raf2 = 0;
+    let tExit = 0;
+    if (starting && grow) {
+      raf1 = window.requestAnimationFrame(() => {
+        tick();
+        raf2 = window.requestAnimationFrame(tick);
+      });
+    }
+    const settleMs = grow || ending ? PLAYBACK_LAYOUT_SETTLE_MS : 0;
+    const tSettle = window.setTimeout(() => {
+      if (ending) {
+        // Parent drops play-surface on the same settle timer; give layout a beat.
+        tExit = window.setTimeout(
+          () => {
+            // Resize then one fitBounds — do not map.stop() first (that cancelled
+            // camera motion and read as blank-then-pop).
+            tick();
+            const coords = selectedCoordsRef.current;
+            if (!coords || coords.length < 2) return;
+            if (view3dRef.current) {
+              startOrbitIfNeeded(m, coords);
+            } else {
+              fitMapToSelectedRoute(m, coords, lightsOffRef.current);
+            }
+          },
+          grow ? PLAYBACK_LAYOUT_EXIT_RESIZE_MS - PLAYBACK_LAYOUT_SETTLE_MS : 0
+        );
+        return;
+      }
+      if (grow) tick();
+    }, settleMs);
+    return () => {
+      if (raf1) window.cancelAnimationFrame(raf1);
+      if (raf2) window.cancelAnimationFrame(raf2);
+      window.clearTimeout(tSettle);
+      if (tExit) window.clearTimeout(tExit);
+    };
+  }, [chasing]);
+
+  useEffect(() => {
+    toggleChaseRef.current = handleToggleChase;
   });
 
   useEffect(() => {
-    const btn = chaseButtonRef.current;
-    if (!btn) return;
-    updateChaseControlButton(btn, {
-      visible: Boolean(activity && can3d),
-      chasing,
-      title: chasing ? t('stopChase') : t('startChase'),
-    });
-  }, [chasing, activity, can3d, t]);
+    const { fullscreenButton, chaseButton } = modeHandlesRef.current;
+    if (fullscreenButton) {
+      updateFullscreenButton(fullscreenButton, {
+        visible: canOfferPlayback,
+        active: isFullscreen,
+        title: isFullscreen ? t('exitFullscreen') : t('enterFullscreen'),
+      });
+    }
+    if (chaseButton) {
+      updateChaseControlButton(chaseButton, {
+        visible: canOfferPlayback,
+        chasing,
+        title: chasing ? t('stopChase') : t('startChase'),
+      });
+    }
+  }, [chasing, isFullscreen, canOfferPlayback, t]);
 
   useEffect(() => {
     if (!mapContainer.current) return;
@@ -404,6 +868,9 @@ function TrackMap({
     mapReady.current = false;
     styleIdleRef.current = false;
     animKeyRef.current = null;
+    videoCaptureRef.current?.abort();
+    videoCaptureRef.current = null;
+    setExporting(false);
     chaseRef.current.stop({ silent: true });
     const mapInstance = new mapboxgl.Map({
       container: mapContainer.current,
@@ -413,6 +880,8 @@ function TrackMap({
       pitch: 0,
       maxPitch: 85,
       attributionControl: false,
+      /** Needed so WebGL frames remain readable for MediaRecorder export. */
+      preserveDrawingBuffer: true,
       language: mapLabelLanguage(locale),
       locale: mapboxControlLocale(t),
     });
@@ -427,34 +896,41 @@ function TrackMap({
 
     mapInstance.addControl(new mapboxgl.NavigationControl(), 'top-right');
 
-    // Custom "3D chase" button as a real Mapbox control (no overlay).
-    const chaseControl: mapboxgl.IControl = {
-      onAdd: () => {
-        const root = document.createElement('div');
-        root.className = 'route-map-3d-ctrl mapboxgl-ctrl mapboxgl-ctrl-group';
-
-        const btn = createChaseControlButton();
-        chaseButtonRef.current = btn;
-        btn.onclick = () => toggle3dRef.current();
-        updateChaseControlButton(btn, {
-          visible: Boolean(activity && can3d),
+    const detachModeButtons = attachMapModeButtons(
+      mapInstance,
+      {
+        onToggleChase: () => toggleChaseRef.current(),
+      },
+      modeHandlesRef.current
+    );
+    {
+      const { fullscreenButton, chaseButton } = modeHandlesRef.current;
+      if (fullscreenButton) {
+        updateFullscreenButton(fullscreenButton, {
+          visible: canOfferPlayback,
+          active: false,
+          title: t('enterFullscreen'),
+        });
+      }
+      if (chaseButton) {
+        updateChaseControlButton(chaseButton, {
+          visible: canOfferPlayback,
           chasing: false,
           title: t('startChase'),
         });
-
-        root.appendChild(btn);
-        return root;
-      },
-      onRemove: () => {
-        chaseButtonRef.current = null;
-      },
-    };
-    mapInstance.addControl(chaseControl, 'top-right');
-
-    if (!useBlank) {
-      // Add after chase so chase appears above fullscreen.
-      mapInstance.addControl(new mapboxgl.FullscreenControl(), 'top-right');
+      }
     }
+
+    const syncFullscreen = () => {
+      const next = isMapFullscreen(mapInstance);
+      setIsFullscreen(next);
+      requestAnimationFrame(() => mapInstance.resize());
+    };
+    document.addEventListener('fullscreenchange', syncFullscreen);
+    document.addEventListener(
+      'webkitfullscreenchange' as 'fullscreenchange',
+      syncFullscreen
+    );
 
     let settled = false;
     let timedOut = false;
@@ -499,7 +975,8 @@ function TrackMap({
 
     const onUserCameraChange = (event: { originalEvent?: Event }) => {
       if (!event.originalEvent) return;
-      if (chaseRef.current.isAnimating()) return;
+      if (chaseRef.current.isAnimating() || orbitRef.current.isAnimating())
+        return;
       if (map.current !== mapInstance) return;
       try {
         if (
@@ -522,10 +999,11 @@ function TrackMap({
       }
       mapReady.current = true;
       styleIdleRef.current = false;
+      // Blank privacy styles can already be idle inside this event, so draw now.
+      updateRoutesRef.current();
       mapInstance.once('idle', () => {
         if (map.current !== mapInstance) return;
         styleIdleRef.current = true;
-        injectMapTerrain(mapInstance, dark !== false, can3d);
         updateRoutesRef.current();
       });
     });
@@ -534,11 +1012,40 @@ function TrackMap({
     mapInstance.on('rotateend', onUserCameraChange);
     mapInstance.on('pitchend', onUserCameraChange);
 
+    // Resize after dock handoff / container size changes. Hosts skip
+    // play-spring while lockHeight so this does not run mid-tween.
+    const resizeMap = () => {
+      try {
+        mapInstance.resize();
+      } catch {
+        /* map may already be gone */
+      }
+    };
+    const ro = new ResizeObserver(() => {
+      resizeMap();
+      requestAnimationFrame(resizeMap);
+    });
+    if (mapContainer.current) ro.observe(mapContainer.current);
+    const onDockSettled = () => {
+      resizeMap();
+      requestAnimationFrame(resizeMap);
+    };
+    window.addEventListener('mobile-map-dock-settled', onDockSettled);
+
     const chase = chaseRef.current;
+    const orbit = orbitRef.current;
     return () => {
       window.clearTimeout(timer);
+      ro.disconnect();
+      window.removeEventListener('mobile-map-dock-settled', onDockSettled);
+      document.removeEventListener('fullscreenchange', syncFullscreen);
+      document.removeEventListener(
+        'webkitfullscreenchange' as 'fullscreenchange',
+        syncFullscreen
+      );
+      detachModeButtons?.();
       chase.stop({ silent: true });
-      chaseButtonRef.current = null;
+      orbit.dispose();
       mapInstance.off('error', onError);
       mapInstance.off('dragend', onUserCameraChange);
       mapInstance.off('zoomend', onUserCameraChange);
@@ -556,9 +1063,11 @@ function TrackMap({
 
   useEffect(() => {
     setNeedsRecenter(false);
-    if (mapReady.current && styleIdleRef.current) {
-      updateRoutesRef.current();
-    }
+    const m = map.current;
+    // Do not wait for map 'idle': 3D orbit jumpTo keeps the map busy forever,
+    // so a styleIdle gate would drop activity switches after 3D is enabled.
+    if (!mapReady.current || !m?.isStyleLoaded()) return;
+    updateRoutesRef.current();
   }, [activity, activities]);
 
   useEffect(() => {
@@ -580,34 +1089,95 @@ function TrackMap({
 
   return (
     <div
-      className="route-map-hover-ctrls relative h-full w-full"
-      style={lightsOff ? { backgroundColor: bg } : undefined}
+      ref={bindFsRoot}
+      className={
+        chasing
+          ? 'route-map-hover-ctrls route-map-fs-root is-playing relative h-full w-full'
+          : 'route-map-hover-ctrls route-map-fs-root relative h-full w-full'
+      }
+      style={
+        {
+          ...(lightsOff ? { backgroundColor: bg } : null),
+          ...(chasing ? { '--playback-hud-height': `${hudHeight}px` } : null),
+        } as CSSProperties
+      }
     >
-      {needsRecenter ? (
-        <button
-          type="button"
-          className="route-map-recenter absolute top-3 left-3 z-10"
-          aria-label={t('locateTrack')}
-          title={t('locateTrack')}
-          onClick={() => refitViewRef.current()}
-        >
-          <svg
-            className="h-4 w-4"
-            fill="none"
-            viewBox="0 0 24 24"
-            stroke="currentColor"
-            strokeWidth={2}
-            aria-hidden
-          >
-            <path
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              d="M12 2v4m0 12v4M2 12h4m12 0h4M12 8a4 4 0 100 8 4 4 0 000-8z"
-            />
-          </svg>
-        </button>
+      {canOffer3d || needsRecenter ? (
+        <div className="route-map-top-left absolute top-3 left-3 z-10 flex items-center gap-2">
+          {canOffer3d ? (
+            <button
+              type="button"
+              className={`route-map-toolbar-3d${view3d ? 'is-active' : ''}`}
+              aria-pressed={view3d}
+              aria-label={view3d ? t('disable3d') : t('enable3d')}
+              title={view3d ? t('disable3d') : t('enable3d')}
+              onClick={handleToggle3d}
+            >
+              3D
+            </button>
+          ) : null}
+          {needsRecenter ? (
+            <button
+              type="button"
+              className="route-map-recenter"
+              aria-label={t('locateTrack')}
+              title={t('locateTrack')}
+              onClick={() => refitViewRef.current()}
+            >
+              <svg
+                className="h-4 w-4"
+                fill="none"
+                viewBox="0 0 24 24"
+                stroke="currentColor"
+                strokeWidth={2}
+                aria-hidden
+              >
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  d="M12 2v4m0 12v4M2 12h4m12 0h4M12 8a4 4 0 100 8 4 4 0 000-8z"
+                />
+              </svg>
+            </button>
+          ) : null}
+        </div>
       ) : null}
       <div ref={mapContainer} className="h-full w-full" />
+      {chasing && playbackSnap ? (
+        <PlaybackHudView
+          snap={playbackSnap}
+          hrSeries={playbackSeries?.hr ?? null}
+          timeSeries={playbackSeries?.time ?? null}
+          movingTimeSec={activity ? parseMovingTime(activity.moving_time) : 0}
+          averageSpeedMs={activity?.average_speed ?? 0}
+          fullscreen={isFullscreen}
+          dark={dark !== false}
+          exporting={exporting}
+          exportEnding={exportEnding}
+          exportConverting={exportConverting}
+          exportMessage={exportMessage}
+          onTogglePause={() => {
+            if (chaseRef.current.isPaused()) chaseRef.current.resume();
+            else chaseRef.current.pause();
+          }}
+          onCycleSpeed={() => {
+            chaseRef.current.setSpeed(
+              nextPlaybackSpeed(chaseRef.current.getSpeed())
+            );
+          }}
+          onSeek={(p) => chaseRef.current.seek(p)}
+          onShowEndpointsChange={(show) =>
+            chaseRef.current.setShowEndpoints(show)
+          }
+          onLockOrientationChange={(locked) =>
+            chaseRef.current.setBearingLocked(locked)
+          }
+          onExport={(opts) => {
+            void handleExportVideo(opts);
+          }}
+          onHeightChange={setHudHeight}
+        />
+      ) : null}
     </div>
   );
 }
@@ -637,7 +1207,26 @@ export function TracksPage({
   const [selectedActivity, setSelectedActivity] = useState<Activity | null>(
     null
   );
+  const [mapPlaying, setMapPlaying] = useState(false);
+  // Keep play surface tall while outer shell clips down on exit (avoids white flash).
+  // Desktop card does not grow — skip is-play-sized or the start pin drifts off-route.
+  const [playSurfaceSized, setPlaySurfaceSized] = useState(false);
+  const isPlaybackGrowViewport = () =>
+    typeof window !== 'undefined' &&
+    window.matchMedia('(max-width: 1023px)').matches;
+  useLayoutEffect(() => {
+    if (mapPlaying && isPlaybackGrowViewport()) setPlaySurfaceSized(true);
+  }, [mapPlaying]);
+  useEffect(() => {
+    if (mapPlaying) return;
+    const delay = isPlaybackGrowViewport() ? PLAYBACK_LAYOUT_SETTLE_MS : 0;
+    const t = window.setTimeout(() => setPlaySurfaceSized(false), delay);
+    return () => window.clearTimeout(t);
+  }, [mapPlaying]);
   const [sortBy, setSortBy] = useState<'date' | 'distance'>('date');
+  const mapSlotRef = useRef<HTMLDivElement>(null);
+  const mapPinRef = useRef<HTMLDivElement>(null);
+  const mapDock = useMobileMapDock(true, mapSlotRef, mapPinRef, 'tracks');
 
   // Export
   const captureRef = useRef<HTMLDivElement>(null);
@@ -666,8 +1255,18 @@ export function TracksPage({
     return true;
   });
 
-  const withPolyline = base.filter(
-    (a) => a.summary_polyline && a.summary_polyline.length > 20
+  const withPolyline = useMemo(
+    () =>
+      activities.filter((a) => {
+        if (
+          selectedYear !== null &&
+          new Date(a.start_date_local).getFullYear() !== selectedYear
+        )
+          return false;
+        if (sportFilter !== null && a.type !== sportFilter) return false;
+        return Boolean(a.summary_polyline && a.summary_polyline.length > 20);
+      }),
+    [activities, selectedYear, sportFilter]
   );
 
   // Stats for left panel
@@ -838,15 +1437,18 @@ export function TracksPage({
             </div>
           </div>
 
-          {/* Activity detail — only when a single track is selected */}
-          {selectedActivity && (
+          {/* Activity detail — hide bulky static summary while playback HUD is up */}
+          {selectedActivity && !mapPlaying && (
             <div className="card order-3 px-4 py-3 lg:order-none">
               <div className="mb-2 flex items-center justify-between gap-2">
                 <p className="eyebrow text-[10px] text-[var(--color-muted)]">
                   {locale === 'zh' ? '已选记录' : 'Selected'}
                 </p>
                 <button
-                  onClick={() => setSelectedActivity(null)}
+                  onClick={() => {
+                    setMapPlaying(false);
+                    setSelectedActivity(null);
+                  }}
                   className="text-[var(--color-muted)] transition-colors hover:text-[var(--color-text)]"
                 >
                   <svg
@@ -945,17 +1547,62 @@ export function TracksPage({
             </div>
           )}
 
-          {/* Map — sticky on mobile while browsing the track wall */}
-          <div className="sticky top-16 z-40 order-2 -my-2 py-2 lg:static lg:z-auto lg:order-none lg:my-0 lg:py-0">
-            <div className="card h-[220px] overflow-hidden [--card-shadow:var(--shadow-card-hover)] md:h-[360px] lg:[--card-shadow:var(--shadow-card)]">
-              <TrackMap
-                activity={selectedActivity}
-                activities={withPolyline}
-                dark={dark}
-                lightsOff={lightsOff}
-              />
+          {/* Map — placeholder slot + pinRef. Expanded = always fixed (Option A). */}
+          <div
+            ref={mapSlotRef}
+            className="order-2 lg:order-none"
+            style={
+              mapDock.lockHeight && mapDock.frame
+                ? { height: mapDock.frame.height }
+                : undefined
+            }
+          >
+            <div
+              ref={mapPinRef}
+              className={mapDock.fillHeight ? 'h-full' : undefined}
+            >
+              <div
+                className={`card overflow-hidden [--card-shadow:var(--shadow-card-hover)] lg:[--card-shadow:var(--shadow-card)] ${
+                  // No height tween while dock fixed/handoff — Mapbox blanks.
+                  mapDock.fillHeight ||
+                  mapDock.lockHeight ||
+                  mapDock.pinMotion != null
+                    ? ''
+                    : 'route-map-play-spring'
+                } ${
+                  mapDock.fillHeight
+                    ? 'h-full'
+                    : mapPlaying
+                      ? 'h-[min(70vh,520px)] md:h-[min(65vh,560px)]'
+                      : 'h-[280px] md:h-[360px]'
+                }`}
+              >
+                <div
+                  className={
+                    playSurfaceSized
+                      ? 'route-map-play-surface is-play-sized'
+                      : 'route-map-play-surface'
+                  }
+                >
+                  <TrackMap
+                    activity={selectedActivity}
+                    activities={withPolyline}
+                    dark={dark}
+                    lightsOff={lightsOff}
+                    onPlaybackChange={setMapPlaying}
+                  />
+                </div>
+              </div>
             </div>
           </div>
+          {mapDock.showFab ? (
+            <MapDockFab
+              expanded={mapDock.expanded}
+              labelShow={locale === 'zh' ? '显示轨迹' : 'Show map'}
+              labelHide={locale === 'zh' ? '收起轨迹' : 'Hide map'}
+              onToggle={mapDock.toggle}
+            />
+          ) : null}
         </div>
 
         {/* Right: track grid with year filter inside */}
