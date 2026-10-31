@@ -19,8 +19,6 @@ const PIN_OUT_MS = 420;
 const AT_HOME_PX = 12;
 /** Keep slot spacer after unfixed so in-flow height owns layout. */
 const HANDOFF_MS = 100;
-/** Wait for the scroll to settle before auto-collapsing the dock. */
-const AUTO_COLLAPSE_SETTLE_MS = 140;
 
 export type MapDockFrame = {
   left: number;
@@ -518,43 +516,32 @@ export function useMobileMapDock(
    *
    * Option A keeps the dock pinned until the user taps the FAB, so scrolling
    * back to where the in-flow map already fits on screen still showed the
-   * floating map. Whenever the whole slot sits between the sticky header and
-   * the bottom of the viewport, hand the map back to the flow. Scroll driven
-   * only — never on mount — so it cannot fight the enter motion.
+   * floating map.
    *
-   * Debounced on purpose: reading layout on every scroll frame, and starting
-   * the release animation mid-momentum (when the target slot box is still
-   * moving), is what made the scroll feel rough. Waiting for the scroll to
-   * settle keeps the scroll thread free and lets the hand-back animation
-   * land on the final slot position instead of snapping.
+   * Uses an IntersectionObserver at ratio 1 (root inset by the sticky header)
+   * so it fires on the exact frame the slot clears the header — no scroll
+   * listener and no layout reads of our own, so the scroll thread stays free.
+   * Then hands back with NO motion: at that moment the dock and the slot are
+   * a few pixels apart, so a slide would only read as a stray animation, and
+   * tweening `top` on a fixed Mapbox canvas costs a layout per frame. The FAB
+   * keeps the animated path; this one is silent.
    */
   useEffect(() => {
     if (!active || !expanded) return;
-    let timer = 0;
-    const check = () => {
-      timer = 0;
-      if (pinMotionRef.current === 'out') return;
-      const slot = slotRef.current;
-      if (!slot) return;
-      const rect = slot.getBoundingClientRect();
-      if (rect.width <= 1 || rect.height <= 1) return;
-      const fullyVisible =
-        rect.top >= HEADER_INSET_PX - 2 &&
-        rect.bottom <= window.innerHeight - 2;
-      if (fullyVisible) collapse();
-    };
-    const schedule = () => {
-      if (timer) window.clearTimeout(timer);
-      timer = window.setTimeout(check, AUTO_COLLAPSE_SETTLE_MS);
-    };
-    window.addEventListener('scroll', schedule, { passive: true });
-    window.addEventListener('resize', schedule);
-    return () => {
-      if (timer) window.clearTimeout(timer);
-      window.removeEventListener('scroll', schedule);
-      window.removeEventListener('resize', schedule);
-    };
-  }, [active, expanded, collapse, slotRef]);
+    const slot = slotRef.current;
+    if (!slot) return;
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        if (!entry.isIntersecting || entry.intersectionRatio < 0.999) return;
+        if (!expandedRef.current || pinMotionRef.current === 'out') return;
+        releaseToFlow();
+      },
+      { rootMargin: `-${HEADER_INSET_PX}px 0px 0px 0px`, threshold: 1 }
+    );
+    observer.observe(slot);
+    return () => observer.disconnect();
+  }, [active, expanded, releaseToFlow, slotRef]);
+
   const showFab = active && (expanded || outOfView || holdSpacer);
   // Reserve slot height while away, expanded (map is fixed), or handing off.
   const lockHeight =
